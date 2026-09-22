@@ -1,0 +1,9 @@
+auth "stepfun-cn" {
+	name "Stepfun (China)"
+	login "api-key" {
+		auth-url "https://platform.stepfun.com/interface-key"
+		instructions "Subscribe to Step Plan and copy your Step API key"
+		prompt "Paste your Stepfun API key"
+		validate "models-endpoint" label="Stepfun" url="https://api.stepfun.com/step_plan/v1/models"
+	}
+}

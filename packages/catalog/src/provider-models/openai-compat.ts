@@ -2009,6 +2009,39 @@ export function siliconflowCnModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
+// Stepfun (China) — Step Plan subscription
+// ---------------------------------------------------------------------------
+
+const STEPFUN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1";
+
+export interface StepfunCnModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+/**
+ * Step Plan's `/v1/models` lists speech, image, and embedding ids next to the
+ * chat roster and carries no per-model type field. Non-chat ids are dropped
+ * by the `stepfun-cn` exclude-models rule. Known chat ids keep the seeded
+ * windows through the bundled reference; the live list is authoritative.
+ */
+export function stepfunCnModelManagerOptions(
+	config?: StepfunCnModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
+		providerId: "stepfun-cn",
+		defaultBaseUrl: STEPFUN_CN_BASE_URL,
+		config,
+		requireApiKey: true,
+		dynamicModelsAuthoritative: true,
+		filterModel: (_entry, model) => !isExcludedModel("stepfun-cn", model.id),
+		mapModel: mapWithBundledReference,
+	});
+}
+
+// ---------------------------------------------------------------------------
 // 6.7 Zhipu Coding Plan
 // ---------------------------------------------------------------------------
 
