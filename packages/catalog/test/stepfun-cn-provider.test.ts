@@ -1,13 +1,21 @@
-import { describe, expect, test } from "bun:test";
-import { getOAuthProviders } from "@oh-my-pi/pi-ai/registry/oauth";
+import { Database } from "bun:sqlite";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { getEnvApiKey } from "@oh-my-pi/pi-ai/stream";
-import { isExcludedModel } from "@oh-my-pi/pi-catalog/compat/behavior";
-import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
+import type { AssistantMessage, ThinkingContent, ToolCall } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { stepfunCnModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
-import type { FetchImpl } from "@oh-my-pi/pi-catalog/types";
-import modelsJson from "../src/models.json";
+import type { FetchImpl, Model } from "@oh-my-pi/pi-catalog/types";
 
 const STEP_PLAN_BASE_URL = "https://api.stepfun.com/step_plan/v1";
+const PLAN_KEY = "step-plan-test-key";
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 function withEnv(key: string, value: string | undefined, run: () => void): void {
 	const previous = Bun.env[key];
@@ -27,107 +35,168 @@ function withEnv(key: string, value: string | undefined, run: () => void): void 
 	}
 }
 
+/** A Step Plan row as discovery hands it to `buildModel`: no authored thinking or compat. */
+function stepPlanModel(id: string): Model<"openai-completions"> {
+	return buildModel({
+		id,
+		name: id,
+		api: "openai-completions",
+		provider: "stepfun-cn",
+		baseUrl: STEP_PLAN_BASE_URL,
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 256_000,
+		maxTokens: null,
+	});
+}
+
+function assistantTurn(model: Model<"openai-completions">, content: AssistantMessage["content"]): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: 1_700_000_000_000,
+	};
+}
+
+function readToolCall(id: string): ToolCall {
+	return { type: "toolCall", id, name: "read", arguments: { path: "README.md" } };
+}
+
+function replayedReasoning(model: Model<"openai-completions">, content: AssistantMessage["content"]): unknown {
+	const messages = convertMessages(model, { messages: [assistantTurn(model, content)] }, model.compat);
+	const assistant: object | undefined = messages.find(message => message.role === "assistant");
+	return assistant && "reasoning_content" in assistant ? assistant.reasoning_content : undefined;
+}
+
+async function loginWithProbe(respond: FetchImpl): Promise<SqliteAuthCredentialStore> {
+	const store = new SqliteAuthCredentialStore(new Database(":memory:"));
+	const storage = new AuthStorage(store);
+	await storage.reload();
+	await storage.login("stepfun-cn", { onAuth: () => {}, onPrompt: async () => PLAN_KEY, fetch: respond });
+	return store;
+}
+
 describe("stepfun-cn Step Plan provider", () => {
-	test("shows Stepfun (China) in /login and reads the Step Plan key", () => {
-		const provider = getOAuthProviders().find(item => item.id === "stepfun-cn");
-		expect(provider?.name).toBe("Stepfun (China)");
-		expect(provider?.available).toBe(true);
-		expect(DEFAULT_MODEL_PER_PROVIDER["stepfun-cn"]).toBe("step-5-preview");
-		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "stepfun-cn");
-		expect(descriptor?.dynamicModelsAuthoritative).toBe(true);
-		expect(descriptor?.createModelManagerOptions({ apiKey: "k" }).providerId).toBe("stepfun-cn");
-
-		withEnv("STEP_API_KEY", "docs-key", () => {
-			withEnv("STEPFUN_CN_API_KEY", undefined, () => {
-				expect(getEnvApiKey("stepfun-cn")).toBe("docs-key");
+	it("reads only the Step Plan key variable, never the pay-as-you-go STEP_API_KEY", () => {
+		withEnv("STEPFUN_CN_API_KEY", undefined, () => {
+			withEnv("STEP_API_KEY", "pay-as-you-go-key", () => {
+				expect(getEnvApiKey("stepfun-cn")).toBeUndefined();
 			});
 		});
-		withEnv("STEP_API_KEY", "docs-key", () => {
-			withEnv("STEPFUN_CN_API_KEY", "plan-key", () => {
-				expect(getEnvApiKey("stepfun-cn")).toBe("plan-key");
-			});
+		withEnv("STEPFUN_CN_API_KEY", PLAN_KEY, () => {
+			expect(getEnvApiKey("stepfun-cn")).toBe(PLAN_KEY);
 		});
 	});
 
-	test("bundles the Step Plan chat roster at the subscription endpoint", () => {
-		const models = modelsJson["stepfun-cn"];
-		expect(Object.keys(models).sort()).toEqual([
-			"step-3.5-flash",
-			"step-3.5-flash-2603",
-			"step-3.7-flash",
-			"step-5-preview",
-			"step-router-v1",
+	it("validates a pasted key with a one-token chat call on the Step Plan path", async () => {
+		const probes: { url: string; body: unknown }[] = [];
+		const store = await loginWithProbe(
+			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				probes.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+				return Response.json({ choices: [] });
+			}),
+		);
+
+		expect(probes).toEqual([
+			{
+				url: `${STEP_PLAN_BASE_URL}/chat/completions`,
+				body: expect.objectContaining({ model: "step-3.5-flash", max_tokens: 1 }),
+			},
 		]);
-
-		const preview = models["step-5-preview"];
-		expect(preview?.baseUrl).toBe(STEP_PLAN_BASE_URL);
-		expect(preview?.api).toBe("openai-completions");
-		expect(preview?.contextWindow).toBe(1_000_000);
-		expect(preview?.maxTokens).toBe(64_000);
-		expect(preview?.input).toEqual(["text", "image"]);
-		expect(preview?.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-		expect(preview?.thinking).toEqual({ mode: "effort", efforts: ["low", "medium", "high"] });
-		expect(preview?.compat.maxTokensField).toBe("max_tokens");
-		expect(preview?.compat.supportsStore).toBe(false);
-		expect(preview?.compat.supportsDeveloperRole).toBe(false);
-
-		const flash = models["step-3.7-flash"];
-		expect(flash?.contextWindow).toBe(256_000);
-		expect(flash?.maxTokens).toBeNull();
-		expect(flash?.input).toEqual(["text", "image"]);
-
-		const text = models["step-3.5-flash"];
-		expect(text?.contextWindow).toBe(256_000);
-		expect(text?.input).toEqual(["text"]);
-		expect(text?.thinking).toEqual({ mode: "effort", efforts: ["low", "medium", "high"] });
-
-		// 2603 publishes only two effort tiers. Sending medium is rejected.
-		expect(models["step-3.5-flash-2603"]?.thinking).toEqual({ mode: "effort", efforts: ["low", "high"] });
-		expect(models["step-3.5-flash-2603"]?.input).toEqual(["text"]);
-
-		// The router can select the 256K flash engine, so the shared id must not
-		// advertise the 1M decision-engine window.
-		const router = models["step-router-v1"];
-		expect(router?.contextWindow).toBe(256_000);
-		expect(router?.maxTokens).toBeNull();
-		expect(router?.input).toEqual(["text"]);
+		expect(probes[0]?.body).not.toHaveProperty("max_completion_tokens");
+		expect(store.getApiKey("stepfun-cn")).toBe(PLAN_KEY);
 	});
 
-	test("live discovery keeps seeded chat windows and drops speech and image generators", async () => {
-		expect(isExcludedModel("stepfun-cn", "stepaudio-2.5-tts")).toBe(true);
-		expect(isExcludedModel("stepfun-cn", "step-image-edit-2")).toBe(true);
-		expect(isExcludedModel("stepfun-cn", "step-5-preview")).toBe(false);
+	it("rejects a key only when the probe reports an auth failure", async () => {
+		const refused = loginWithProbe(vi.fn(async () => Response.json({ error: "invalid key" }, { status: 401 })));
+		await expect(refused).rejects.toThrow("401");
 
-		const seen: string[] = [];
-		const stubFetch: FetchImpl = async input => {
-			seen.push(String(input));
-			return new Response(
-				JSON.stringify({
-					object: "list",
-					data: [
-						{ id: "step-5-preview", object: "model", owned_by: "stepai" },
-						{ id: "stepaudio-2.5-realtime", object: "model", owned_by: "stepai" },
-						{ id: "step-image-edit-2", object: "model", owned_by: "stepai" },
-						{ id: "step-new-chat", object: "model", owned_by: "stepai" },
-					],
-				}),
-				{ status: 200, headers: { "content-type": "application/json" } },
-			);
+		const unjudged = await loginWithProbe(
+			vi.fn(async () => Response.json({ error: "unsupported parameter" }, { status: 400 })),
+		);
+		expect(unjudged.getApiKey("stepfun-cn")).toBe(PLAN_KEY);
+	});
+
+	it("offers only low and high on the step-3.5 pair, where the family ladder has medium", () => {
+		expect(getSupportedEfforts(stepPlanModel("step-3.5-flash"))).toEqual([Effort.Low, Effort.High]);
+		expect(getSupportedEfforts(stepPlanModel("step-3.5-flash-2603"))).toEqual([Effort.Low, Effort.High]);
+		expect(getSupportedEfforts(stepPlanModel("step-3.7-flash"))).toEqual([Effort.Low, Effort.Medium, Effort.High]);
+	});
+
+	it("replays reasoning_content on tool-call turns and never sends a synthetic placeholder", () => {
+		// step-router-v1 can route tool work to deepseek-v4-pro, which needs the
+		// prior reasoning back and rejects a made-up placeholder.
+		const model = stepPlanModel("step-router-v1");
+		const thinking: ThinkingContent = {
+			type: "thinking",
+			thinking: "Read the file before answering.",
+			thinkingSignature: "reasoning_content",
 		};
+
+		expect(replayedReasoning(model, [thinking, readToolCall("call_read")])).toBe("Read the file before answering.");
+		expect(replayedReasoning(model, [readToolCall("call_bare")])).toBe("");
+	});
+
+	it("keeps reviewed rows for known ids, reads a new id's own metadata, and drops speech SKUs", async () => {
+		const requested: string[] = [];
+		const fetchMock: FetchImpl = vi.fn(async (input: string | URL | Request) => {
+			const url = String(input);
+			requested.push(url);
+			if (url !== `${STEP_PLAN_BASE_URL}/models`) return new Response("not found", { status: 404 });
+			return Response.json({
+				object: "list",
+				data: [
+					// A listing that claims medium must not widen the documented ladder.
+					{
+						id: "step-3.5-flash",
+						enable_reason: true,
+						max_input_tokens: 262_144,
+						reasoning_effort_support_list: ["low", "medium", "high"],
+					},
+					{
+						id: "step-6-flash",
+						enable_reason: true,
+						max_input_tokens: 512_000,
+						reasoning_effort_support_list: ["low", "high"],
+					},
+					{ id: "step-new-chat" },
+					{ id: "stepaudio-2.5-chat" },
+					{ id: "stepaudio-2.5-realtime" },
+					{ id: "stepaudio-2.5-tts" },
+					{ id: "stepaudio-2.5-asr" },
+				],
+			});
+		});
+
 		const discovered = await stepfunCnModelManagerOptions({
-			apiKey: "plan-key",
-			fetch: stubFetch,
+			apiKey: PLAN_KEY,
+			fetch: fetchMock,
 		}).fetchDynamicModels?.();
-		expect(seen).toEqual([`${STEP_PLAN_BASE_URL}/models`]);
-		const ids = discovered?.map(model => model.id).sort();
-		expect(ids).toEqual(["step-5-preview", "step-new-chat"]);
-		const preview = discovered?.find(model => model.id === "step-5-preview");
-		expect(preview?.contextWindow).toBe(1_000_000);
-		expect(preview?.maxTokens).toBe(64_000);
-		expect(preview?.input).toEqual(["text", "image"]);
-		expect(preview?.baseUrl).toBe(STEP_PLAN_BASE_URL);
-		const fresh = discovered?.find(model => model.id === "step-new-chat");
-		expect(fresh?.contextWindow).toBeNull();
-		expect(fresh?.input).toEqual(["text"]);
+		const byId = new Map(discovered?.map(model => [model.id, model]));
+
+		expect(requested).toContain(`${STEP_PLAN_BASE_URL}/models`);
+		expect([...byId.keys()].sort()).toEqual(["step-3.5-flash", "step-6-flash", "step-new-chat"]);
+		expect(byId.get("step-3.5-flash")?.thinking?.efforts).toEqual([Effort.Low, Effort.High]);
+		expect(byId.get("step-3.5-flash")?.contextWindow).toBe(256_000);
+		expect(byId.get("step-6-flash")).toMatchObject({
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.High] },
+			contextWindow: 512_000,
+			baseUrl: STEP_PLAN_BASE_URL,
+		});
+		expect(byId.get("step-new-chat")).toMatchObject({ reasoning: false, contextWindow: null });
 	});
 });
