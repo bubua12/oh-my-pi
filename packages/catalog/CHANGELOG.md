@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added StepFun Step Plan (China) (`stepfun-cn`) as a built-in provider with API-key login and live model discovery ([#12791](https://github.com/can1357/oh-my-pi/pull/12791) by [@bubua12](https://github.com/bubua12)).
+
 ## [18.4.3] - 2026-09-28
 
 ### Added
