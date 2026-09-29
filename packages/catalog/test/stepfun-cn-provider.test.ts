@@ -1,5 +1,8 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import { convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { getEnvApiKey } from "@oh-my-pi/pi-ai/stream";
@@ -7,6 +10,7 @@ import type { AssistantMessage, ThinkingContent, ToolCall } from "@oh-my-pi/pi-a
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
@@ -201,9 +205,11 @@ describe("stepfun-cn Step Plan provider", () => {
 			Response.json({
 				object: "list",
 				data: [
-					// A listing that claims medium and a wider window must not rewrite the seed.
+					// Listing ceilings and a wider effort ladder must not rewrite the seed.
 					{
 						id: "step-3.5-flash",
+						context_length: 12_345,
+						max_completion_tokens: 2,
 						max_input_tokens: 262_144,
 						reasoning_effort_support_list: ["low", "medium", "high"],
 					},
@@ -222,7 +228,6 @@ describe("stepfun-cn Step Plan provider", () => {
 		) as unknown as FetchImpl;
 
 		const options = stepfunCnModelManagerOptions({ apiKey: PLAN_KEY, fetch: fetchMock });
-		expect(options.dynamicModelsAuthoritative).toBe(true);
 		const discovered = await options.fetchDynamicModels?.();
 		const byId = new Map(discovered?.map(model => [model.id, model]));
 
@@ -236,6 +241,7 @@ describe("stepfun-cn Step Plan provider", () => {
 		expect([...byId.keys()].sort()).toEqual(["step-3.5-flash", "step-6-flash", "step-new-chat"]);
 		expect(byId.get("step-3.5-flash")?.thinking?.efforts).toEqual([Effort.Low, Effort.High]);
 		expect(byId.get("step-3.5-flash")?.contextWindow).toBe(256_000);
+		expect(byId.get("step-3.5-flash")?.maxTokens).toBeNull();
 		expect(byId.get("step-6-flash")).toMatchObject({
 			reasoning: true,
 			thinking: { mode: "effort", efforts: [Effort.Low, Effort.High] },
@@ -246,6 +252,34 @@ describe("stepfun-cn Step Plan provider", () => {
 		});
 		expect(byId.get("step-new-chat")).toMatchObject({ reasoning: false, contextWindow: null });
 		expect(byId.get("step-new-chat")?.thinking).toBeUndefined();
+	});
+
+	it("drops a retired seed id through the manager, not only the authoritative flag", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-stepfun-cn-prune-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const liveRoster = getBundledModels("stepfun-cn").filter(model => model.id !== "step-3.5-flash");
+		const options = {
+			...stepfunCnModelManagerOptions({
+				apiKey: PLAN_KEY,
+				fetch: (async () =>
+					new Response(JSON.stringify({ data: liveRoster.map(model => ({ id: model.id })) }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					})) as unknown as FetchImpl,
+			}),
+			staticModels: getBundledModels("stepfun-cn"),
+			cacheDbPath: dbPath,
+		};
+
+		try {
+			expect(options.dynamicModelsAuthoritative).toBe(true);
+			const result = await resolveProviderModels(options, "online");
+			expect(result.models.map(model => model.id)).not.toContain("step-3.5-flash");
+			expect(result.models.map(model => model.id)).toContain("step-5-preview");
+			expect(result.stale).toBe(false);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("classifies Step Plan non-chat SKUs without touching chat ids", () => {

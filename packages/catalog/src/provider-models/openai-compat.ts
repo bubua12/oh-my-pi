@@ -5085,10 +5085,11 @@ export interface StepfunCnModelManagerConfig {
 /**
  * Step Plan model manager: OpenAI-compatible chat completions at
  * `api.stepfun.com/step_plan/v1`. A successful `/models` snapshot is
- * authoritative over the bundled seed (`providers/stepfun-cn.kdl`). Known ids
- * keep that seed via `mapWithBundledReference`. An id the seed does not know
- * yet takes `reasoning_effort_support_list` and otherwise stays on the generic
- * defaults, matching `stepfun`.
+ * authoritative over which bundled ids remain (`providers/stepfun-cn.kdl`).
+ * A known id keeps the seed's context window and output cap: the shared
+ * mapper would otherwise copy `context_length` and `max_completion_tokens`.
+ * An id the seed does not know yet takes `reasoning_effort_support_list` and
+ * otherwise stays on the generic defaults, matching `stepfun`.
  */
 export function stepfunCnModelManagerOptions(
 	config?: StepfunCnModelManagerConfig,
@@ -5102,7 +5103,13 @@ export function stepfunCnModelManagerOptions(
 		filterModel: (_entry, model) => isStepfunCnChatModelId(model.id),
 		mapModel: (entry, model, reference) => {
 			const mapped = mapWithBundledReference(entry, model, reference);
-			if (reference) return mapped;
+			if (reference) {
+				return {
+					...mapped,
+					contextWindow: reference.contextWindow,
+					maxTokens: reference.maxTokens,
+				};
+			}
 			const thinking = mapStepfunThinking(entry);
 			return thinking === undefined ? mapped : { ...mapped, reasoning: true, thinking };
 		},
